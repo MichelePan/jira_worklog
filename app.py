@@ -1,6 +1,5 @@
 import streamlit as st
 import pandas as pd
-import altair as alt
 from datetime import date, timedelta
 from requests.auth import HTTPBasicAuth
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -44,7 +43,6 @@ if date_from > date_to:
     st.sidebar.error("Intervallo non valido: 'Dal' deve essere <= 'Al'.")
     st.stop()
 
-# (opzionale) warning UX
 if (date_to - date_from).days > 40:
     st.sidebar.warning("Range > ~40 giorni: potrebbe essere lento.")
 
@@ -59,7 +57,6 @@ if refresh:
 pref_from = date_from - timedelta(days=MARGIN_DAYS)
 pref_to = date_to + timedelta(days=MARGIN_DAYS)
 
-# pre-filtro su updated per ridurre le issue candidate
 jql_effective = (
     f"({default_jql}) "
     f'AND updated >= "{pref_from.isoformat()}" '
@@ -218,38 +215,19 @@ st.divider()
 
 
 # ======================
-# MAIN VIEW
+# TABLE + DOWNLOAD
 # ======================
-left, right = st.columns([2, 1])
+st.subheader("Dettaglio")
 
-with left:
-    st.subheader("Dettaglio")
+df_show = df_view.copy()
+df_show["Data"] = pd.to_datetime(df_show["Data"]).dt.strftime("%d/%m/%Y")
+df_show = df_show[["Data", "Utente", "IssueType", "Issue", "Summary", "Ore"]]
 
-    df_show = df_view.copy()
-    df_show["Data"] = pd.to_datetime(df_show["Data"]).dt.strftime("%d/%m/%Y")
-    df_show = df_show[["Data", "Utente", "IssueType", "Issue", "Summary", "Ore"]]
+st.dataframe(df_show, use_container_width=True, hide_index=True)
 
-    st.dataframe(df_show, use_container_width=True, hide_index=True)
-
-    st.download_button(
-        "Download CSV",
-        data=df_show.to_csv(index=False).encode("utf-8"),
-        file_name=f"worklog_{date_from.isoformat()}_{date_to.isoformat()}.csv",
-        mime="text/csv",
-    )
-
-with right:
-    st.subheader("Ore per utente")
-    agg = df_view.groupby("Utente", as_index=False)["Ore"].sum().sort_values("Ore", ascending=False)
-
-    chart = (
-        alt.Chart(agg)
-        .mark_bar()
-        .encode(
-            x=alt.X("Ore:Q", title="Ore"),
-            y=alt.Y("Utente:N", sort="-x", title=""),
-            tooltip=["Utente", "Ore"],
-        )
-        .properties(height=420)
-    )
-    st.altair_chart(chart, use_container_width=True)
+st.download_button(
+    "Download CSV",
+    data=df_show.to_csv(index=False).encode("utf-8"),
+    file_name=f"worklog_{date_from.isoformat()}_{date_to.isoformat()}.csv",
+    mime="text/csv",
+)
