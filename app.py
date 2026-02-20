@@ -1,10 +1,11 @@
 import streamlit as st
 import pandas as pd
 import altair as alt
-from datetime import date
+from datetime import date, timedelta
+from requests.auth import HTTPBasicAuth
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from jira_client import fetch_worklogs_by_jql
-
+from jira_client import search_issues_jql_v3, get_issue_worklogs_v3
 
 # ======================
 # STREAMLIT CONFIG
@@ -12,88 +13,176 @@ from jira_client import fetch_worklogs_by_jql
 st.set_page_config(page_title="Jira Worklog Dashboard", layout="wide")
 st.title("Jira Worklog Dashboard")
 
-
 # ======================
 # SECRETS
 # ======================
 jira_domain = st.secrets["JIRA_DOMAIN"]
 email = st.secrets["JIRA_EMAIL"]
 api_token = st.secrets["JIRA_API_TOKEN"]
-default_jql = st.secrets.get("DEFAULT_JQL", "project = KAN AND created >= \"2026-01-01\"")
 
+# Usa apici singoli fuori se vuoi le virgolette dentro la JQL
+default_jql = st.secrets.get("DEFAULT_JQL", 'project = KAN')
+
+BASE_URL = f"https://{jira_domain}/rest/api/3"
+AUTH = HTTPBasicAuth(email, api_token)
 
 # ======================
-# SIDEBAR - INPUT
+# SIDEBAR
 # ======================
 st.sidebar.header("Filtri")
 
-jql = st.sidebar.text_area("JQL", value=default_jql, height=80)
-refresh = st.sidebar.button("Aggiorna dati")
+jql_base = st.sidebar.text_area("JQL (base)", value=default_jql, height=80)
 
+# Date range
+today = date.today()
+default_from = today - timedelta(days=7)
 
-# ======================
-# DATA LOADING
-# ======================
-@st.cache_data(ttl=300, show_spinner=False)
-def load_data(jql: str) -> pd.DataFrame:
-    rows = fetch_worklogs_by_jql(
-        jira_domain=jira_domain,
-        email=email,
-        api_token=api_token,
-        jql=jql,
-    )
-    df = pd.DataFrame(rows)
-    if df.empty:
-        return df
-
-    # Normalizzazioni
-    df["Ore"] = pd.to_numeric(df["Ore"], errors="coerce").fillna(0.0)
-    df["Data"] = pd.to_datetime(df["Data"], errors="coerce").dt.date
-
-    # Elimina righe senza data (worklog malformati)
-    df = df.dropna(subset=["Data"])
-
-    return df
-
-
-if refresh:
-    st.cache_data.clear()
-
-with st.spinner("Caricamento dati da Jira..."):
-    try:
-        df_all = load_data(jql)
-    except Exception as e:
-        st.error("Errore chiamando Jira. Dettagli tecnici:")
-        st.code(str(e))
-        st.stop()
-
-if df_all.empty:
-    st.info("Nessun dato trovato per la JQL inserita.")
-    st.stop()
-
-
-# ======================
-# SIDEBAR - DATE FILTER (DA / A) + OTHER FILTERS
-# ======================
-min_d = df_all["Data"].min()
-max_d = df_all["Data"].max()
-
-# Date picker vincolati ai dati disponibili
-date_from = st.sidebar.date_input("Dal", value=min_d, min_value=min_d, max_value=max_d)
-date_to = st.sidebar.date_input("Al", value=max_d, min_value=min_d, max_value=max_d)
+date_from = st.sidebar.date_input("Dal", value=default_from)
+date_to = st.sidebar.date_input("Al", value=today)
 
 if date_from > date_to:
     st.sidebar.error("Intervallo non valido: 'Dal' deve essere <= 'Al'.")
     st.stop()
 
-# Applica filtro date
-df = df_all[(df_all["Data"] >= date_from) & (df_all["Data"] <= date_to)].copy()
+# Limite consigliato
+if (date_to - date_from).days > 40:
+    st.sidebar.warning("Range > ~40 giorni: può essere lento. Valuta di restringere o di affinare la JQL.")
 
-if df.empty:
-    st.info("Nessun worklog nell’intervallo selezionato.")
+# Pre-filtro per performance (updated)
+margin_days = st.sidebar.number_input("Margine giorni (updated prefilter)", min_value=0, max_value=14, value=3, step=1)
+
+pref_from = date_from - timedelta(days=int(margin_days))
+pref_to = date_to + timedelta(days=int(margin_days))
+jql_effective = f"({jql_base}) AND updated >= \"{pref_from.isoformat()}\" AND updated <= \"{pref_to.isoformat()}\""
+
+st.sidebar.caption("JQL effettiva (con pre-filtro updated):")
+st.sidebar.code(jql_effective)
+
+max_workers = st.sidebar.slider("Parallelismo (worklog fetch)", min_value=1, max_value=16, value=10)
+
+refresh = st.sidebar.button("Aggiorna (svuota cache)")
+
+if refresh:
+    st.cache_data.clear()
+
+# ======================
+# CACHES
+# ======================
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_search_issues(jql: str):
+    # Cache della search per 1 ora
+    return search_issues_jql_v3(
+        base_url=BASE_URL,
+        auth=AUTH,
+        jql=jql,
+        fields=["summary", "issuetype"],
+    )
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_issue_worklogs(issue_key: str):
+    # Cache dei worklog per issue per 1 ora
+    return get_issue_worklogs_v3(
+        base_url=BASE_URL,
+        auth=AUTH,
+        issue_key=issue_key,
+    )
+
+def build_dataframe(issues, date_from: date, date_to: date) -> pd.DataFrame:
+    rows = []
+
+    # Pre-estrai info issue (così non le perdiamo nel parallelismo)
+    issues_info = []
+    for issue in issues:
+        key = issue.get("key", "")
+        fields = issue.get("fields", {}) or {}
+        summary = fields.get("summary", "") or ""
+        issue_type = (fields.get("issuetype") or {}).get("name", "") or ""
+        if key:
+            issues_info.append((key, summary, issue_type))
+
+    # Fetch worklogs (parallelo)
+    if max_workers == 1:
+        for key, summary, issue_type in issues_info:
+            worklogs = cached_issue_worklogs(key)
+            rows.extend(_rows_from_worklogs(worklogs, key, summary, issue_type, date_from, date_to))
+    else:
+        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+            future_map = {
+                ex.submit(cached_issue_worklogs, key): (key, summary, issue_type)
+                for (key, summary, issue_type) in issues_info
+            }
+            for fut in as_completed(future_map):
+                key, summary, issue_type = future_map[fut]
+                worklogs = fut.result()
+                rows.extend(_rows_from_worklogs(worklogs, key, summary, issue_type, date_from, date_to))
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    df["Ore"] = pd.to_numeric(df["Ore"], errors="coerce").fillna(0.0)
+    df["Data"] = pd.to_datetime(df["Data"], errors="coerce").dt.date
+    df = df.dropna(subset=["Data"])
+    return df
+
+def _rows_from_worklogs(worklogs, issue_key, summary, issue_type, date_from: date, date_to: date):
+    out = []
+    for wl in worklogs:
+        author = (wl.get("author") or {}).get("displayName", "") or ""
+        started = wl.get("started", "") or ""
+        seconds = wl.get("timeSpentSeconds", 0) or 0
+
+        if not started:
+            continue
+
+        wl_day = pd.to_datetime(started[:10], errors="coerce").date()
+        if wl_day is None:
+            continue
+        if wl_day < date_from or wl_day > date_to:
+            continue
+
+        out.append(
+            {
+                "Data": wl_day,
+                "Utente": author,
+                "IssueType": issue_type,
+                "Issue": issue_key,
+                "Summary": summary,
+                "Ore": round(seconds / 3600, 2),
+            }
+        )
+    return out
+
+# ======================
+# LOAD + BUILD
+# ======================
+with st.spinner("Ricerca issue (cache attiva)..."):
+    try:
+        issues = cached_search_issues(jql_effective)
+    except Exception as e:
+        st.error("Errore durante la search Jira:")
+        st.code(str(e))
+        st.stop()
+
+if not issues:
+    st.info("Nessuna issue trovata con la JQL effettiva.")
     st.stop()
 
-# Filtri single-select
+with st.spinner("Download worklog (cache attiva)..."):
+    try:
+        df = build_dataframe(issues, date_from, date_to)
+    except Exception as e:
+        st.error("Errore durante il download dei worklog:")
+        st.code(str(e))
+        st.stop()
+
+if df.empty:
+    st.info("Nessun worklog nel range selezionato.")
+    st.stop()
+
+# ======================
+# FILTERS (post-load, veloci)
+# ======================
 users = ["(tutti)"] + sorted([u for u in df["Utente"].dropna().unique().tolist() if str(u).strip()])
 types = ["(tutti)"] + sorted([t for t in df["IssueType"].dropna().unique().tolist() if str(t).strip()])
 
@@ -108,11 +197,6 @@ if type_sel != "(tutti)":
 
 df_view = df_view.sort_values(["Data", "Utente", "Issue"])
 
-if df_view.empty:
-    st.info("Nessun dato dopo l’applicazione dei filtri selezionati.")
-    st.stop()
-
-
 # ======================
 # KPI
 # ======================
@@ -123,20 +207,13 @@ c3.metric("N. issue", f"{df_view['Issue'].nunique()}")
 
 st.divider()
 
-
-# ======================
-# MAIN LAYOUT
-# ======================
 left, right = st.columns([2, 1])
 
 with left:
     st.subheader("Dettaglio")
 
-    # Formattazione per visualizzazione
     df_show = df_view.copy()
     df_show["Data"] = pd.to_datetime(df_show["Data"]).dt.strftime("%d/%m/%Y")
-
-    # Ordine colonne richiesto (Data + Issue Type incluse)
     df_show = df_show[["Data", "Utente", "IssueType", "Issue", "Summary", "Ore"]]
 
     st.dataframe(df_show, use_container_width=True, hide_index=True)
