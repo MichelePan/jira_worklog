@@ -19,7 +19,7 @@ st.title("Jira Worklog Dashboard")
 jira_domain = st.secrets["JIRA_DOMAIN"]
 email = st.secrets["JIRA_EMAIL"]
 api_token = st.secrets["JIRA_API_TOKEN"]
-default_jql = st.secrets.get("DEFAULT_JQL", "project = KAN AND created >= "2026-01-01"")
+default_jql = st.secrets.get("DEFAULT_JQL", "project = KAN AND created >= \"2026-01-01\"")
 
 
 # ======================
