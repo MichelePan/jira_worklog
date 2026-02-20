@@ -7,70 +7,71 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from jira_client import search_issues_jql_v3, get_issue_worklogs_v3
 
+
 # ======================
 # STREAMLIT CONFIG
 # ======================
 st.set_page_config(page_title="Jira Worklog Dashboard", layout="wide")
 st.title("Jira Worklog Dashboard")
 
+
 # ======================
-# SECRETS
+# SECRETS / CONFIG
 # ======================
 jira_domain = st.secrets["JIRA_DOMAIN"]
 email = st.secrets["JIRA_EMAIL"]
 api_token = st.secrets["JIRA_API_TOKEN"]
-
-# Usa apici singoli fuori se vuoi le virgolette dentro la JQL
-default_jql = st.secrets.get("DEFAULT_JQL", 'project = KAN')
+default_jql = st.secrets.get("DEFAULT_JQL", "project = KAN")
 
 BASE_URL = f"https://{jira_domain}/rest/api/3"
 AUTH = HTTPBasicAuth(email, api_token)
+
+# Performance knobs (non in sidebar)
+MAX_WORKERS = 10
+MARGIN_DAYS = 3  # margine fisso per pre-filtro su updated
+
 
 # ======================
 # SIDEBAR
 # ======================
 st.sidebar.header("Filtri")
 
-jql_base = st.sidebar.text_area("JQL (base)", value=default_jql, height=80)
-
-# Date range
 today = date.today()
-default_from = today - timedelta(days=7)
-
-date_from = st.sidebar.date_input("Dal", value=default_from)
+date_from = st.sidebar.date_input("Dal", value=today - timedelta(days=7))
 date_to = st.sidebar.date_input("Al", value=today)
 
 if date_from > date_to:
     st.sidebar.error("Intervallo non valido: 'Dal' deve essere <= 'Al'.")
     st.stop()
 
-# Limite consigliato
+# (opzionale) warning UX
 if (date_to - date_from).days > 40:
-    st.sidebar.warning("Range > ~40 giorni: può essere lento. Valuta di restringere o di affinare la JQL.")
+    st.sidebar.warning("Range > ~40 giorni: potrebbe essere lento.")
 
-# Pre-filtro per performance (updated)
-margin_days = st.sidebar.number_input("Margine giorni (updated prefilter)", min_value=0, max_value=14, value=3, step=1)
-
-pref_from = date_from - timedelta(days=int(margin_days))
-pref_to = date_to + timedelta(days=int(margin_days))
-jql_effective = f"({jql_base}) AND updated >= \"{pref_from.isoformat()}\" AND updated <= \"{pref_to.isoformat()}\""
-
-st.sidebar.caption("JQL effettiva (con pre-filtro updated):")
-st.sidebar.code(jql_effective)
-
-max_workers = st.sidebar.slider("Parallelismo (worklog fetch)", min_value=1, max_value=16, value=10)
-
-refresh = st.sidebar.button("Aggiorna (svuota cache)")
-
+refresh = st.sidebar.button("Aggiorna dati (svuota cache)")
 if refresh:
     st.cache_data.clear()
+
+
+# ======================
+# JQL EFFECTIVE (non mostrata in UI)
+# ======================
+pref_from = date_from - timedelta(days=MARGIN_DAYS)
+pref_to = date_to + timedelta(days=MARGIN_DAYS)
+
+# pre-filtro su updated per ridurre le issue candidate
+jql_effective = (
+    f"({default_jql}) "
+    f'AND updated >= "{pref_from.isoformat()}" '
+    f'AND updated <= "{pref_to.isoformat()}"'
+)
+
 
 # ======================
 # CACHES
 # ======================
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_search_issues(jql: str):
-    # Cache della search per 1 ora
     return search_issues_jql_v3(
         base_url=BASE_URL,
         auth=AUTH,
@@ -80,17 +81,46 @@ def cached_search_issues(jql: str):
 
 @st.cache_data(ttl=3600, show_spinner=False)
 def cached_issue_worklogs(issue_key: str):
-    # Cache dei worklog per issue per 1 ora
     return get_issue_worklogs_v3(
         base_url=BASE_URL,
         auth=AUTH,
         issue_key=issue_key,
     )
 
+
+def _rows_from_worklogs(worklogs, issue_key, summary, issue_type, date_from: date, date_to: date):
+    out = []
+    for wl in worklogs:
+        author = (wl.get("author") or {}).get("displayName", "") or ""
+        started = wl.get("started", "") or ""
+        seconds = wl.get("timeSpentSeconds", 0) or 0
+        if not started:
+            continue
+
+        wl_day = pd.to_datetime(started[:10], errors="coerce")
+        if pd.isna(wl_day):
+            continue
+        wl_day = wl_day.date()
+
+        if wl_day < date_from or wl_day > date_to:
+            continue
+
+        out.append(
+            {
+                "Data": wl_day,
+                "Utente": author,
+                "IssueType": issue_type,
+                "Issue": issue_key,
+                "Summary": summary,
+                "Ore": round(seconds / 3600, 2),
+            }
+        )
+    return out
+
+
 def build_dataframe(issues, date_from: date, date_to: date) -> pd.DataFrame:
     rows = []
 
-    # Pre-estrai info issue (così non le perdiamo nel parallelismo)
     issues_info = []
     for issue in issues:
         key = issue.get("key", "")
@@ -100,13 +130,13 @@ def build_dataframe(issues, date_from: date, date_to: date) -> pd.DataFrame:
         if key:
             issues_info.append((key, summary, issue_type))
 
-    # Fetch worklogs (parallelo)
-    if max_workers == 1:
+    # Fetch parallelo dei worklog (cache attiva)
+    if MAX_WORKERS <= 1:
         for key, summary, issue_type in issues_info:
             worklogs = cached_issue_worklogs(key)
             rows.extend(_rows_from_worklogs(worklogs, key, summary, issue_type, date_from, date_to))
     else:
-        with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             future_map = {
                 ex.submit(cached_issue_worklogs, key): (key, summary, issue_type)
                 for (key, summary, issue_type) in issues_info
@@ -125,38 +155,11 @@ def build_dataframe(issues, date_from: date, date_to: date) -> pd.DataFrame:
     df = df.dropna(subset=["Data"])
     return df
 
-def _rows_from_worklogs(worklogs, issue_key, summary, issue_type, date_from: date, date_to: date):
-    out = []
-    for wl in worklogs:
-        author = (wl.get("author") or {}).get("displayName", "") or ""
-        started = wl.get("started", "") or ""
-        seconds = wl.get("timeSpentSeconds", 0) or 0
-
-        if not started:
-            continue
-
-        wl_day = pd.to_datetime(started[:10], errors="coerce").date()
-        if wl_day is None:
-            continue
-        if wl_day < date_from or wl_day > date_to:
-            continue
-
-        out.append(
-            {
-                "Data": wl_day,
-                "Utente": author,
-                "IssueType": issue_type,
-                "Issue": issue_key,
-                "Summary": summary,
-                "Ore": round(seconds / 3600, 2),
-            }
-        )
-    return out
 
 # ======================
-# LOAD + BUILD
+# LOAD DATA
 # ======================
-with st.spinner("Ricerca issue (cache attiva)..."):
+with st.spinner("Ricerca issue su Jira..."):
     try:
         issues = cached_search_issues(jql_effective)
     except Exception as e:
@@ -165,10 +168,10 @@ with st.spinner("Ricerca issue (cache attiva)..."):
         st.stop()
 
 if not issues:
-    st.info("Nessuna issue trovata con la JQL effettiva.")
+    st.info("Nessuna issue trovata nel periodo selezionato.")
     st.stop()
 
-with st.spinner("Download worklog (cache attiva)..."):
+with st.spinner("Caricamento worklog (cache attiva)..."):
     try:
         df = build_dataframe(issues, date_from, date_to)
     except Exception as e:
@@ -180,8 +183,9 @@ if df.empty:
     st.info("Nessun worklog nel range selezionato.")
     st.stop()
 
+
 # ======================
-# FILTERS (post-load, veloci)
+# POST-FILTERS (fast)
 # ======================
 users = ["(tutti)"] + sorted([u for u in df["Utente"].dropna().unique().tolist() if str(u).strip()])
 types = ["(tutti)"] + sorted([t for t in df["IssueType"].dropna().unique().tolist() if str(t).strip()])
@@ -197,6 +201,11 @@ if type_sel != "(tutti)":
 
 df_view = df_view.sort_values(["Data", "Utente", "Issue"])
 
+if df_view.empty:
+    st.info("Nessun dato dopo l’applicazione dei filtri.")
+    st.stop()
+
+
 # ======================
 # KPI
 # ======================
@@ -207,6 +216,10 @@ c3.metric("N. issue", f"{df_view['Issue'].nunique()}")
 
 st.divider()
 
+
+# ======================
+# MAIN VIEW
+# ======================
 left, right = st.columns([2, 1])
 
 with left:
