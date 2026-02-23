@@ -73,7 +73,7 @@ def cached_search_issues(jql: str):
         base_url=BASE_URL,
         auth=AUTH,
         jql=jql,
-        fields=["summary", "issuetype"],
+        fields=["summary", "issuetype", "timetracking"]
     )
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -85,7 +85,7 @@ def cached_issue_worklogs(issue_key: str):
     )
 
 
-def _rows_from_worklogs(worklogs, issue_key, summary, issue_type, date_from: date, date_to: date):
+def _rows_from_worklogs(worklogs, issue_key, summary, issue_type, est_hours, date_from: date, date_to: date):
     out = []
     for wl in worklogs:
         author = (wl.get("author") or {}).get("displayName", "") or ""
@@ -109,7 +109,8 @@ def _rows_from_worklogs(worklogs, issue_key, summary, issue_type, date_from: dat
                 "IssueType": issue_type,
                 "Issue": issue_key,
                 "Summary": summary,
-                "Ore": round(seconds / 3600, 2),
+                "Stima": est_hours,
+                "Ore": round(seconds / 3600, 2)
             }
         )
     return out
@@ -124,8 +125,17 @@ def build_dataframe(issues, date_from: date, date_to: date) -> pd.DataFrame:
         fields = issue.get("fields", {}) or {}
         summary = fields.get("summary", "") or ""
         issue_type = (fields.get("issuetype") or {}).get("name", "") or ""
+    
+        # Stima (Original Estimate) in secondi -> ore
+        tt = fields.get("timetracking") or {}
+        est_seconds = tt.get("originalEstimateSeconds")
+        if est_seconds is None:
+            # fallback: alcuni tenant espongono anche "timeoriginalestimate" direttamente
+            est_seconds = fields.get("timeoriginalestimate")
+        est_hours = round((est_seconds or 0) / 3600, 2)
+        
         if key:
-            issues_info.append((key, summary, issue_type))
+            issues_info.append((key, summary, issue_type, est_hours))
 
     # Fetch parallelo dei worklog (cache attiva)
     if MAX_WORKERS <= 1:
@@ -135,13 +145,14 @@ def build_dataframe(issues, date_from: date, date_to: date) -> pd.DataFrame:
     else:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             future_map = {
-                ex.submit(cached_issue_worklogs, key): (key, summary, issue_type)
-                for (key, summary, issue_type) in issues_info
+                ex.submit(cached_issue_worklogs, key): (key, summary, issue_type, est_hours)
+                for (key, summary, issue_type, est_hours) in issues_info
             }
+
             for fut in as_completed(future_map):
-                key, summary, issue_type = future_map[fut]
+                key, summary, issue_type, est_hours = future_map[fut]
                 worklogs = fut.result()
-                rows.extend(_rows_from_worklogs(worklogs, key, summary, issue_type, date_from, date_to))
+                rows.extend(_rows_from_worklogs(worklogs, key, summary, issue_type, est_hours, date_from, date_to))
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -221,7 +232,7 @@ st.subheader("Dettaglio")
 
 df_show = df_view.copy()
 df_show["Data"] = pd.to_datetime(df_show["Data"]).dt.strftime("%d/%m/%Y")
-df_show = df_show[["Data", "Utente", "IssueType", "Issue", "Summary", "Ore"]]
+df_show = df_show[["Data", "Utente", "IssueType", "Issue", "Summary", "Stima", "Ore"]]
 
 st.dataframe(df_show, use_container_width=True, hide_index=True)
 
