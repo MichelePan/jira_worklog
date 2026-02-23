@@ -31,7 +31,7 @@ MARGIN_DAYS = 3
 
 # Cache policy
 TTL_SEARCH = 30 * 60        # 30 min
-TTL_WORKLOG = 12 * 60 * 60  # 12 h
+TTL_WORKLOG = 4 * 60 * 60  # 12 h
 
 
 # ======================
