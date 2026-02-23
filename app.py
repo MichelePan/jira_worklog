@@ -29,9 +29,9 @@ AUTH = HTTPBasicAuth(email, api_token)
 MAX_WORKERS = 10
 MARGIN_DAYS = 3
 
-# Cache policy (più stabile e controllata)
-TTL_SEARCH = 30 * 60      # 30 minuti
-TTL_WORKLOG = 12 * 60 * 60  # 12 ore
+# Cache policy
+TTL_SEARCH = 30 * 60        # 30 min
+TTL_WORKLOG = 12 * 60 * 60  # 12 h
 
 
 # ======================
@@ -69,7 +69,6 @@ jql_effective = (
 # ======================
 @st.cache_data(ttl=TTL_SEARCH, show_spinner=False)
 def cached_search_issues(jql: str):
-    # Prendiamo anche status per mostrare/filtrare
     return search_issues_jql_v3(
         base_url=BASE_URL,
         auth=AUTH,
@@ -104,7 +103,16 @@ def _issue_type_name(fields: dict) -> str:
     it = (fields or {}).get("issuetype") or {}
     return it.get("name", "") or ""
 
-def _rows_from_worklogs(worklogs, issue_key, summary, issue_type, issue_status, est_hours, date_from: date, date_to: date):
+def _rows_from_worklogs(
+    worklogs,
+    issue_key: str,
+    summary: str,
+    issue_type: str,
+    issue_status: str,
+    est_hours: float,
+    date_from: date,
+    date_to: date,
+):
     out = []
     for wl in worklogs:
         author_obj = wl.get("author") or {}
@@ -127,14 +135,14 @@ def _rows_from_worklogs(worklogs, issue_key, summary, issue_type, issue_status, 
         out.append(
             {
                 "Data": wl_day,
-                "Utente": display_name,          # label “umana”
-                "UtenteId": account_id,          # normalizzazione
+                "Utente": display_name,   # UI label
+                "UtenteId": account_id,   # internal key
                 "IssueType": issue_type,
-                "Stato": issue_status,
                 "Issue": issue_key,
                 "Summary": summary,
                 "StimaOre": est_hours,
                 "Ore": round(seconds / 3600, 2),
+                "Stato": issue_status,    # <-- richiesto: in tabella lo metteremo in fondo
             }
         )
     return out
@@ -142,7 +150,6 @@ def _rows_from_worklogs(worklogs, issue_key, summary, issue_type, issue_status, 
 def build_dataframe(issues, date_from: date, date_to: date) -> pd.DataFrame:
     rows = []
 
-    # Pre-estrai info issue (evita di ricalcolare dentro i thread)
     issues_info = []
     for issue in issues:
         key = issue.get("key", "")
@@ -160,7 +167,6 @@ def build_dataframe(issues, date_from: date, date_to: date) -> pd.DataFrame:
             )
         )
 
-    # Fetch parallelo worklog (cache attiva)
     if MAX_WORKERS <= 1:
         for key, summary, itype, istatus, est_hours in issues_info:
             wls = cached_issue_worklogs(key)
@@ -184,6 +190,11 @@ def build_dataframe(issues, date_from: date, date_to: date) -> pd.DataFrame:
     df["StimaOre"] = pd.to_numeric(df["StimaOre"], errors="coerce").fillna(0.0)
     df["Data"] = pd.to_datetime(df["Data"], errors="coerce").dt.date
     df = df.dropna(subset=["Data"])
+
+    # Alcuni worklog possono non avere accountId (raro), ma evitiamo rogne nei filtri
+    df["UtenteId"] = df["UtenteId"].fillna("").astype(str)
+    df["Utente"] = df["Utente"].fillna("").astype(str)
+
     return df
 
 
@@ -218,26 +229,35 @@ if df.empty:
 # ======================
 # POST-FILTERS (fast)
 # ======================
-# Filtro Stato
+# Stato
 statuses = ["(tutti)"] + sorted([s for s in df["Stato"].dropna().unique().tolist() if str(s).strip()])
 status_sel = st.sidebar.selectbox("Stato", statuses)
 
-# Filtro Issue Type
+# IssueType
 types = ["(tutti)"] + sorted([t for t in df["IssueType"].dropna().unique().tolist() if str(t).strip()])
 type_sel = st.sidebar.selectbox("Issue Type", types)
 
-# Filtro Utente (basato su id, mostrato come displayName)
-user_pairs = (
-    df[["UtenteId", "Utente"]]
-    .dropna()
-    .drop_duplicates()
+# Utente (UI pulita)
+# name -> list(accountId)
+name_to_ids = (
+    df.groupby("Utente")["UtenteId"]
+    .apply(lambda s: sorted([x for x in s.dropna().unique().tolist() if str(x).strip()]))
+    .to_dict()
 )
-# ordina per nome (label)
-user_pairs = user_pairs.sort_values("Utente")
-user_options = ["(tutti)"] + [f"{row.Utente} ({row.UtenteId})" for row in user_pairs.itertuples(index=False)]
 
-user_sel = st.sidebar.selectbox("Utente", user_options)
+user_option_to_ids = {"(tutti)": None}
+for name, ids in sorted(name_to_ids.items(), key=lambda x: x[0]):
+    if not str(name).strip():
+        continue
+    if len(ids) <= 1:
+        user_option_to_ids[name] = ids
+    else:
+        # Non mostriamo accountId: solo un contatore per gestire omonimi
+        user_option_to_ids[f"{name} ({len(ids)})"] = ids
 
+user_sel = st.sidebar.selectbox("Utente", list(user_option_to_ids.keys()))
+
+# Applica filtri
 df_view = df.copy()
 
 if status_sel != "(tutti)":
@@ -247,9 +267,8 @@ if type_sel != "(tutti)":
     df_view = df_view[df_view["IssueType"] == type_sel]
 
 if user_sel != "(tutti)":
-    # estrai UtenteId dalla stringa "Nome (accountId)"
-    sel_id = user_sel.split("(")[-1].rstrip(")")
-    df_view = df_view[df_view["UtenteId"] == sel_id]
+    ids = user_option_to_ids[user_sel] or []
+    df_view = df_view[df_view["UtenteId"].isin(ids)]
 
 df_view = df_view.sort_values(["Data", "Utente", "Issue"])
 
@@ -259,7 +278,7 @@ if df_view.empty:
 
 
 # ======================
-# KPI (senza top 10)
+# KPI (no top 10)
 # ======================
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Totale ore", f"{df_view['Ore'].sum():.2f}")
@@ -278,8 +297,8 @@ st.subheader("Dettaglio worklog")
 df_show = df_view.copy()
 df_show["Data"] = pd.to_datetime(df_show["Data"]).dt.strftime("%d/%m/%Y")
 
-# Colonne visibili (UtenteId la teniamo interna, ma puoi mostrarla se vuoi)
-df_show = df_show[["Data", "Utente", "IssueType", "Stato", "Issue", "Summary", "StimaOre", "Ore"]]
+# Richiesto: Stato in ultima posizione (dopo Ore)
+df_show = df_show[["Data", "Utente", "IssueType", "Issue", "Summary", "StimaOre", "Ore", "Stato"]]
 
 st.dataframe(df_show, use_container_width=True, hide_index=True)
 
@@ -305,7 +324,7 @@ pivot = (
         columns="Utente",
         values="Ore",
         aggfunc="sum",
-        fill_value=0.0
+        fill_value=0.0,
     )
     .sort_index()
 )
@@ -332,10 +351,13 @@ st.subheader("Riepilogo: ore per issue")
 
 per_issue = (
     df_view
-    .groupby(["Issue", "Summary", "IssueType", "Stato", "StimaOre"], as_index=False)
+    .groupby(["Issue", "Summary", "IssueType", "StimaOre", "Stato"], as_index=False)
     .agg(Ore=("Ore", "sum"))
     .sort_values(["Ore", "Issue"], ascending=[False, True])
 )
+
+# Anche qui possiamo mettere Stato in ultima posizione (come preferisci)
+per_issue = per_issue[["Issue", "Summary", "IssueType", "StimaOre", "Ore", "Stato"]]
 
 st.dataframe(per_issue, use_container_width=True, hide_index=True)
 
