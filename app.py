@@ -31,7 +31,7 @@ MARGIN_DAYS = 3
 
 # Cache policy
 TTL_SEARCH = 30 * 60        # 30 min
-TTL_WORKLOG = 4 * 60 * 60  # 12 h
+TTL_WORKLOG = 1 * 60 * 60  # 1 h
 
 
 # ======================
@@ -142,7 +142,7 @@ def _rows_from_worklogs(
                 "Summary": summary,
                 "StimaOre": est_hours,
                 "Ore": round(seconds / 3600, 2),
-                "Stato": issue_status,    # <-- richiesto: in tabella lo metteremo in fondo
+                "Stato": issue_status
             }
         )
     return out
