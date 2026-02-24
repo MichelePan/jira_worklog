@@ -203,7 +203,6 @@ def build_dataframe(issues, date_from: date, date_to: date) -> pd.DataFrame:
 with st.spinner("Ricerca issue su Jira..."):
     try:
         issues = cached_search_issues(jql_effective)
-        st.caption(f"Issue trovate dalla search: {len(issues)}")
     except Exception as e:
         st.error("Errore durante la search Jira:")
         st.code(str(e))
