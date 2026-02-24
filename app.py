@@ -59,8 +59,7 @@ pref_from = date_from - timedelta(days=MARGIN_DAYS)
 pref_to = date_to + timedelta(days=MARGIN_DAYS)
 jql_effective = (
     f"({default_jql}) "
-    f'AND updated >= "{pref_from.isoformat()}" '
-    f'AND updated <= "{pref_to.isoformat()}"'
+    f'AND updated >= "{pref_from.isoformat()}"'
 )
 
 
