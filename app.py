@@ -6,13 +6,11 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from jira_client import search_issues_jql_v3, get_issue_worklogs_v3
 
-
 # ======================
 # STREAMLIT CONFIG
 # ======================
 st.set_page_config(page_title="Jira Worklog Dashboard", layout="wide")
 st.title("Jira Worklog Dashboard")
-
 
 # ======================
 # SECRETS / CONFIG
@@ -30,9 +28,8 @@ MAX_WORKERS = 10
 MARGIN_DAYS = 3
 
 # Cache policy
-TTL_SEARCH = 30 * 60        # 30 min
+TTL_SEARCH = 30 * 60  # 30 min
 TTL_WORKLOG = 1 * 60 * 60  # 1 h
-
 
 # ======================
 # SIDEBAR
@@ -62,7 +59,6 @@ jql_effective = (
     f'AND updated >= "{pref_from.isoformat()}"'
 )
 
-
 # ======================
 # CACHES
 # ======================
@@ -72,7 +68,8 @@ def cached_search_issues(jql: str):
         base_url=BASE_URL,
         auth=AUTH,
         jql=jql,
-        fields=["summary", "issuetype", "timetracking", "status"],
+        # Aggiunto "assignee" per ricavare l'Owner del task
+        fields=["summary", "issuetype", "timetracking", "status", "assignee"],
     )
 
 @st.cache_data(ttl=TTL_WORKLOG, show_spinner=False)
@@ -82,7 +79,6 @@ def cached_issue_worklogs(issue_key: str):
         auth=AUTH,
         issue_key=issue_key,
     )
-
 
 # ======================
 # HELPERS
@@ -102,10 +98,16 @@ def _issue_type_name(fields: dict) -> str:
     it = (fields or {}).get("issuetype") or {}
     return it.get("name", "") or ""
 
+def _issue_owner_name(fields: dict) -> str:
+    # "Owner" interpretato come Assignee
+    a = (fields or {}).get("assignee") or {}
+    return a.get("displayName", "") or ""
+
 def _rows_from_worklogs(
     worklogs,
     issue_key: str,
     summary: str,
+    owner: str,
     issue_type: str,
     issue_status: str,
     est_hours: float,
@@ -134,14 +136,15 @@ def _rows_from_worklogs(
         out.append(
             {
                 "Data": wl_day,
-                "Utente": display_name,   # UI label
-                "UtenteId": account_id,   # internal key
+                "Utente": display_name,  # UI label
+                "UtenteId": account_id,  # internal key
                 "IssueType": issue_type,
                 "Issue": issue_key,
                 "Summary": summary,
+                "Owner": owner,          # <-- NEW
                 "StimaOre": est_hours,
                 "Ore": round(seconds / 3600, 2),
-                "Stato": issue_status
+                "Stato": issue_status,
             }
         )
     return out
@@ -160,6 +163,7 @@ def build_dataframe(issues, date_from: date, date_to: date) -> pd.DataFrame:
             (
                 key,
                 fields.get("summary", "") or "",
+                _issue_owner_name(fields),   # <-- NEW
                 _issue_type_name(fields),
                 _issue_status_name(fields),
                 _issue_estimate_hours(fields),
@@ -167,19 +171,27 @@ def build_dataframe(issues, date_from: date, date_to: date) -> pd.DataFrame:
         )
 
     if MAX_WORKERS <= 1:
-        for key, summary, itype, istatus, est_hours in issues_info:
+        for key, summary, owner, itype, istatus, est_hours in issues_info:
             wls = cached_issue_worklogs(key)
-            rows.extend(_rows_from_worklogs(wls, key, summary, itype, istatus, est_hours, date_from, date_to))
+            rows.extend(
+                _rows_from_worklogs(
+                    wls, key, summary, owner, itype, istatus, est_hours, date_from, date_to
+                )
+            )
     else:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             future_map = {
-                ex.submit(cached_issue_worklogs, key): (key, summary, itype, istatus, est_hours)
-                for (key, summary, itype, istatus, est_hours) in issues_info
+                ex.submit(cached_issue_worklogs, key): (key, summary, owner, itype, istatus, est_hours)
+                for (key, summary, owner, itype, istatus, est_hours) in issues_info
             }
             for fut in as_completed(future_map):
-                key, summary, itype, istatus, est_hours = future_map[fut]
+                key, summary, owner, itype, istatus, est_hours = future_map[fut]
                 wls = fut.result()
-                rows.extend(_rows_from_worklogs(wls, key, summary, itype, istatus, est_hours, date_from, date_to))
+                rows.extend(
+                    _rows_from_worklogs(
+                        wls, key, summary, owner, itype, istatus, est_hours, date_from, date_to
+                    )
+                )
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -194,8 +206,10 @@ def build_dataframe(issues, date_from: date, date_to: date) -> pd.DataFrame:
     df["UtenteId"] = df["UtenteId"].fillna("").astype(str)
     df["Utente"] = df["Utente"].fillna("").astype(str)
 
-    return df
+    # Owner potrebbe essere vuoto se l'issue non ha assignee
+    df["Owner"] = df["Owner"].fillna("").astype(str)
 
+    return df
 
 # ======================
 # LOAD DATA
@@ -223,7 +237,6 @@ with st.spinner("Caricamento worklog (cache attiva)..."):
 if df.empty:
     st.info("Nessun worklog nel range selezionato.")
     st.stop()
-
 
 # ======================
 # POST-FILTERS (fast)
@@ -275,7 +288,6 @@ if df_view.empty:
     st.info("Nessun dato dopo l’applicazione dei filtri.")
     st.stop()
 
-
 # ======================
 # KPI (no top 10)
 # ======================
@@ -287,7 +299,6 @@ c4.metric("N. utenti", f"{df_view['UtenteId'].nunique()}")
 
 st.divider()
 
-
 # ======================
 # VISTA 1: DETTAGLIO
 # ======================
@@ -296,7 +307,8 @@ st.subheader("Dettaglio worklog")
 df_show = df_view.copy()
 df_show["Data"] = pd.to_datetime(df_show["Data"]).dt.strftime("%d/%m/%Y")
 
-# Richiesto: Stato in ultima posizione (dopo Ore)
+# Nota: qui non ho aggiunto Owner perché tu l'hai chiesto sulla pivot "ore per issue".
+# Se lo vuoi anche nel dettaglio, dimmelo e lo mettiamo tra Summary e StimaOre.
 df_show = df_show[["Data", "Utente", "IssueType", "Issue", "Summary", "StimaOre", "Ore", "Stato"]]
 
 st.dataframe(df_show, use_container_width=True, hide_index=True)
@@ -309,7 +321,6 @@ st.download_button(
 )
 
 st.divider()
-
 
 # ======================
 # VISTA 2: PIVOT ORE PER GIORNO / UTENTE
@@ -342,7 +353,6 @@ st.download_button(
 
 st.divider()
 
-
 # ======================
 # VISTA 3: ORE PER ISSUE (aggregata)
 # ======================
@@ -350,13 +360,12 @@ st.subheader("Riepilogo: ore per issue")
 
 per_issue = (
     df_view
-    .groupby(["Issue", "Summary", "IssueType", "StimaOre", "Stato"], as_index=False)
+    .groupby(["Issue", "Summary", "Owner", "IssueType", "StimaOre", "Stato"], as_index=False)
     .agg(Ore=("Ore", "sum"))
     .sort_values(["Ore", "Issue"], ascending=[False, True])
 )
 
-# Anche qui possiamo mettere Stato in ultima posizione (come preferisci)
-per_issue = per_issue[["Issue", "Summary", "IssueType", "StimaOre", "Ore", "Stato"]]
+per_issue = per_issue[["Issue", "Summary", "Owner", "IssueType", "StimaOre", "Ore", "Stato"]]
 
 st.dataframe(per_issue, use_container_width=True, hide_index=True)
 
