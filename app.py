@@ -4,6 +4,8 @@ from datetime import date, timedelta
 from requests.auth import HTTPBasicAuth
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
+import requests
+
 from jira_client import search_issues_jql_v3, get_issue_worklogs_v3
 
 # ======================
@@ -20,8 +22,15 @@ email = st.secrets["JIRA_EMAIL"]
 api_token = st.secrets["JIRA_API_TOKEN"]
 default_jql = st.secrets.get("DEFAULT_JQL", "project = KAN")
 
+# Se nel tuo Jira (company-managed) l'epica è in un custom field "Epic Link",
+# metti l'id qui (es: "customfield_10014") in secrets:
+# EPIC_LINK_FIELD_ID: customfield_10014
+EPIC_LINK_FIELD_ID = st.secrets.get("EPIC_LINK_FIELD_ID", None)
+
 BASE_URL = f"https://{jira_domain}/rest/api/3"
 AUTH = HTTPBasicAuth(email, api_token)
+
+HEADERS_GET = {"Accept": "application/json"}
 
 # Performance knobs (non in sidebar)
 MAX_WORKERS = 10
@@ -30,6 +39,7 @@ MARGIN_DAYS = 3
 # Cache policy
 TTL_SEARCH = 30 * 60  # 30 min
 TTL_WORKLOG = 1 * 60 * 60  # 1 h
+TTL_EPIC = 6 * 60 * 60  # 6 h (nomi epiche cambiano raramente)
 
 # ======================
 # SIDEBAR
@@ -64,12 +74,15 @@ jql_effective = (
 # ======================
 @st.cache_data(ttl=TTL_SEARCH, show_spinner=False)
 def cached_search_issues(jql: str):
+    fields = ["summary", "issuetype", "timetracking", "status", "assignee", "parent"]
+    if EPIC_LINK_FIELD_ID:
+        fields.append(EPIC_LINK_FIELD_ID)
+
     return search_issues_jql_v3(
         base_url=BASE_URL,
         auth=AUTH,
         jql=jql,
-        # Aggiunto "assignee" per ricavare l'Owner del task
-        fields=["summary", "issuetype", "timetracking", "status", "assignee"],
+        fields=fields,
     )
 
 @st.cache_data(ttl=TTL_WORKLOG, show_spinner=False)
@@ -79,6 +92,25 @@ def cached_issue_worklogs(issue_key: str):
         auth=AUTH,
         issue_key=issue_key,
     )
+
+@st.cache_data(ttl=TTL_EPIC, show_spinner=False)
+def cached_issue_summary(issue_key: str) -> str:
+    """
+    Recupera la summary di una issue (qui usata per risolvere EpicName).
+    Usa Jira REST v3: GET /issue/{issueKey}?fields=summary
+    """
+    url = f"{BASE_URL}/issue/{issue_key}"
+    params = {"fields": "summary"}
+    resp = requests.get(url, params=params, headers=HEADERS_GET, auth=AUTH, timeout=60)
+
+    if not resp.ok:
+        # Non blocchiamo la dashboard se un'epic non è accessibile:
+        # ritorniamo stringa vuota (ma logghiamo in UI in modo soft).
+        return ""
+
+    data = resp.json() or {}
+    fields = data.get("fields", {}) or {}
+    return fields.get("summary", "") or ""
 
 # ======================
 # HELPERS
@@ -103,6 +135,25 @@ def _issue_owner_name(fields: dict) -> str:
     a = (fields or {}).get("assignee") or {}
     return a.get("displayName", "") or ""
 
+def _issue_parent_key(fields: dict) -> str:
+    parent = (fields or {}).get("parent") or {}
+    return parent.get("key", "") or ""
+
+def _issue_epic_key(fields: dict) -> str:
+    """
+    Strategia:
+    1) Se EPIC_LINK_FIELD_ID (company-managed) è configurato, prova a leggere fields[customfield].
+       Spesso è direttamente la key dell'epic (stringa).
+    2) Fallback su parent.key (team-managed: Story/Task -> Epic).
+       Nota: per sub-task, parent.key è tipicamente Story/Task (non epic).
+    """
+    if EPIC_LINK_FIELD_ID:
+        v = (fields or {}).get(EPIC_LINK_FIELD_ID)
+        if isinstance(v, str) and v.strip():
+            return v.strip()
+
+    return _issue_parent_key(fields)
+
 def _rows_from_worklogs(
     worklogs,
     issue_key: str,
@@ -111,6 +162,8 @@ def _rows_from_worklogs(
     issue_type: str,
     issue_status: str,
     est_hours: float,
+    epic_key: str,
+    epic_name: str,
     date_from: date,
     date_to: date,
 ):
@@ -141,7 +194,9 @@ def _rows_from_worklogs(
                 "IssueType": issue_type,
                 "Issue": issue_key,
                 "Summary": summary,
-                "Owner": owner,          # <-- NEW
+                "Owner": owner,  # Assignee
+                "EpicKey": epic_key,
+                "EpicName": epic_name,
                 "StimaOre": est_hours,
                 "Ore": round(seconds / 3600, 2),
                 "Stato": issue_status,
@@ -149,47 +204,105 @@ def _rows_from_worklogs(
         )
     return out
 
+def _resolve_epic_names(epic_keys):
+    """
+    Dato un set/list di EpicKey, ritorna dict EpicKey -> EpicName (summary).
+    Esegue fetch parallelo con cache per chiave.
+    """
+    epic_keys = [k for k in sorted(set(epic_keys)) if str(k).strip()]
+    if not epic_keys:
+        return {}
+
+    out = {}
+
+    # Limita parallelismo: reuse MAX_WORKERS ma non più di 10 per non stressare
+    workers = min(max(MAX_WORKERS, 1), 10)
+
+    if workers <= 1:
+        for k in epic_keys:
+            out[k] = cached_issue_summary(k)
+        return out
+
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        fut_map = {ex.submit(cached_issue_summary, k): k for k in epic_keys}
+        for fut in as_completed(fut_map):
+            k = fut_map[fut]
+            try:
+                out[k] = fut.result() or ""
+            except Exception:
+                out[k] = ""
+    return out
+
 def build_dataframe(issues, date_from: date, date_to: date) -> pd.DataFrame:
     rows = []
 
     issues_info = []
+    epic_keys_seen = []
+
     for issue in issues:
         key = issue.get("key", "")
         fields = issue.get("fields", {}) or {}
         if not key:
             continue
 
+        epic_key = _issue_epic_key(fields)
+        epic_keys_seen.append(epic_key)
+
         issues_info.append(
             (
                 key,
                 fields.get("summary", "") or "",
-                _issue_owner_name(fields),   # <-- NEW
+                _issue_owner_name(fields),
                 _issue_type_name(fields),
                 _issue_status_name(fields),
                 _issue_estimate_hours(fields),
+                epic_key,
             )
         )
 
+    # Risolvi EpicName (summary) con chiamata dedicata per le EpicKey
+    epic_map = _resolve_epic_names(epic_keys_seen)
+
     if MAX_WORKERS <= 1:
-        for key, summary, owner, itype, istatus, est_hours in issues_info:
+        for key, summary, owner, itype, istatus, est_hours, epic_key in issues_info:
             wls = cached_issue_worklogs(key)
             rows.extend(
                 _rows_from_worklogs(
-                    wls, key, summary, owner, itype, istatus, est_hours, date_from, date_to
+                    wls,
+                    key,
+                    summary,
+                    owner,
+                    itype,
+                    istatus,
+                    est_hours,
+                    epic_key,
+                    epic_map.get(epic_key, "") or "",
+                    date_from,
+                    date_to,
                 )
             )
     else:
         with ThreadPoolExecutor(max_workers=MAX_WORKERS) as ex:
             future_map = {
-                ex.submit(cached_issue_worklogs, key): (key, summary, owner, itype, istatus, est_hours)
-                for (key, summary, owner, itype, istatus, est_hours) in issues_info
+                ex.submit(cached_issue_worklogs, key): (key, summary, owner, itype, istatus, est_hours, epic_key)
+                for (key, summary, owner, itype, istatus, est_hours, epic_key) in issues_info
             }
             for fut in as_completed(future_map):
-                key, summary, owner, itype, istatus, est_hours = future_map[fut]
+                key, summary, owner, itype, istatus, est_hours, epic_key = future_map[fut]
                 wls = fut.result()
                 rows.extend(
                     _rows_from_worklogs(
-                        wls, key, summary, owner, itype, istatus, est_hours, date_from, date_to
+                        wls,
+                        key,
+                        summary,
+                        owner,
+                        itype,
+                        istatus,
+                        est_hours,
+                        epic_key,
+                        epic_map.get(epic_key, "") or "",
+                        date_from,
+                        date_to,
                     )
                 )
 
@@ -208,6 +321,10 @@ def build_dataframe(issues, date_from: date, date_to: date) -> pd.DataFrame:
 
     # Owner potrebbe essere vuoto se l'issue non ha assignee
     df["Owner"] = df["Owner"].fillna("").astype(str)
+
+    # Epic fields
+    df["EpicKey"] = df["EpicKey"].fillna("").astype(str)
+    df["EpicName"] = df["EpicName"].fillna("").astype(str)
 
     return df
 
@@ -249,8 +366,17 @@ status_sel = st.sidebar.selectbox("Stato", statuses)
 types = ["(tutti)"] + sorted([t for t in df["IssueType"].dropna().unique().tolist() if str(t).strip()])
 type_sel = st.sidebar.selectbox("Issue Type", types)
 
+# Epic filter (name se disponibile, altrimenti key)
+if df["EpicName"].astype(str).str.strip().any():
+    epics = ["(tutte)"] + sorted([e for e in df["EpicName"].dropna().unique().tolist() if str(e).strip()])
+    epic_sel = st.sidebar.selectbox("Epic", epics)
+    epic_mode = "name"
+else:
+    epics = ["(tutte)"] + sorted([e for e in df["EpicKey"].dropna().unique().tolist() if str(e).strip()])
+    epic_sel = st.sidebar.selectbox("Epic (key)", epics)
+    epic_mode = "key"
+
 # Utente (UI pulita)
-# name -> list(accountId)
 name_to_ids = (
     df.groupby("Utente")["UtenteId"]
     .apply(lambda s: sorted([x for x in s.dropna().unique().tolist() if str(x).strip()]))
@@ -264,7 +390,6 @@ for name, ids in sorted(name_to_ids.items(), key=lambda x: x[0]):
     if len(ids) <= 1:
         user_option_to_ids[name] = ids
     else:
-        # Non mostriamo accountId: solo un contatore per gestire omonimi
         user_option_to_ids[f"{name} ({len(ids)})"] = ids
 
 user_sel = st.sidebar.selectbox("Utente", list(user_option_to_ids.keys()))
@@ -277,6 +402,12 @@ if status_sel != "(tutti)":
 
 if type_sel != "(tutti)":
     df_view = df_view[df_view["IssueType"] == type_sel]
+
+if epic_sel != "(tutte)":
+    if epic_mode == "name":
+        df_view = df_view[df_view["EpicName"] == epic_sel]
+    else:
+        df_view = df_view[df_view["EpicKey"] == epic_sel]
 
 if user_sel != "(tutti)":
     ids = user_option_to_ids[user_sel] or []
@@ -307,9 +438,9 @@ st.subheader("Dettaglio worklog")
 df_show = df_view.copy()
 df_show["Data"] = pd.to_datetime(df_show["Data"]).dt.strftime("%d/%m/%Y")
 
-# Nota: qui non ho aggiunto Owner perché tu l'hai chiesto sulla pivot "ore per issue".
-# Se lo vuoi anche nel dettaglio, dimmelo e lo mettiamo tra Summary e StimaOre.
-df_show = df_show[["Data", "Utente", "IssueType", "Issue", "Summary", "StimaOre", "Ore", "Stato"]]
+df_show = df_show[
+    ["Data", "Utente", "IssueType", "Issue", "Summary", "EpicKey", "EpicName", "StimaOre", "Ore", "Stato"]
+]
 
 st.dataframe(df_show, use_container_width=True, hide_index=True)
 
@@ -328,8 +459,7 @@ st.divider()
 st.subheader("Pivot: ore per giorno / utente")
 
 pivot = (
-    df_view
-    .pivot_table(
+    df_view.pivot_table(
         index="Data",
         columns="Utente",
         values="Ore",
@@ -354,24 +484,28 @@ st.download_button(
 st.divider()
 
 # ======================
-# VISTA 3: ORE PER ISSUE (aggregata)
+# VISTA 3: ORE PER ISSUE (aggregata) + EPIC
 # ======================
-st.subheader("Riepilogo: ore per issue")
+st.subheader("Riepilogo: ore per issue (con epica)")
 
 per_issue = (
-    df_view
-    .groupby(["Issue", "Summary", "Owner", "IssueType", "StimaOre", "Stato"], as_index=False)
+    df_view.groupby(
+        ["EpicKey", "EpicName", "Issue", "Summary", "Owner", "IssueType", "StimaOre", "Stato"],
+        as_index=False,
+    )
     .agg(Ore=("Ore", "sum"))
     .sort_values(["Ore", "Issue"], ascending=[False, True])
 )
 
-per_issue = per_issue[["Issue", "Summary", "Owner", "IssueType", "StimaOre", "Ore", "Stato"]]
+per_issue = per_issue[
+    ["EpicKey", "EpicName", "Issue", "Summary", "Owner", "IssueType", "StimaOre", "Ore", "Stato"]
+]
 
 st.dataframe(per_issue, use_container_width=True, hide_index=True)
 
 st.download_button(
-    "Download CSV (ore per issue)",
+    "Download CSV (ore per issue con epica)",
     data=per_issue.to_csv(index=False).encode("utf-8"),
-    file_name=f"worklog_ore_per_issue_{date_from.isoformat()}_{date_to.isoformat()}.csv",
+    file_name=f"worklog_ore_per_issue_con_epica_{date_from.isoformat()}_{date_to.isoformat()}.csv",
     mime="text/csv",
 )
