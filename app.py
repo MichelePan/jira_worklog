@@ -6,6 +6,37 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
+# ======================
+# AUTH
+# ======================
+
+def check_auth():
+    if "authenticated" not in st.session_state:
+        st.session_state["authenticated"] = False
+
+    if not st.session_state["authenticated"]:
+        st.title("Login")
+
+        username = st.text_input("Username")
+        password = st.text_input("Password", type="password")
+
+        if st.button("Login"):
+            if (
+                username == st.secrets["auth"]["username"]
+                and password == st.secrets["auth"]["password"]
+            ):
+                st.session_state["authenticated"] = True
+                st.rerun()
+            else:
+                st.error("Credenziali non valide")
+
+        st.stop()
+
+check_auth()
+# ======================
+# END AUTH
+# ======================
+
 from jira_client import search_issues_jql_v3, get_issue_worklogs_v3
 
 # ======================
