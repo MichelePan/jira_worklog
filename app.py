@@ -503,6 +503,15 @@ pivot = (
 pivot_show = pivot.copy()
 pivot_show.index = pd.to_datetime(pivot_show.index).strftime("%d/%m/%Y")
 
+def highlight_under_8(val):
+    try:
+        if float(val) < 8:
+            return "background-color: #ffcccc"  # rosso chiaro
+    except:
+        pass
+    return ""
+
+styled_pivot = pivot_show.style.applymap(highlight_under_8)
 st.dataframe(pivot_show, use_container_width=True)
 
 st.download_button(
